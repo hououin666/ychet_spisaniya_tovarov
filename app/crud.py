@@ -119,3 +119,5 @@ def get_analytics(db: Session):
         "recent_write_offs": recent_write_offs,
         "total_losses": total_losses
     }
+
+

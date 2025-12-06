@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.models import Response
 from fastapi.security import HTTPBearer
 from sqlalchemy.orm import Session
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime
 
 from analytics import InventoryAnalytics
@@ -266,8 +266,7 @@ def delete_product(
     return {"message": "Product deleted successfully"}
 
 
-
-
+# В эндпоинте создания списания добавляем логику утверждения
 @app.post("/write-offs/", response_model=schemas.WriteOff)
 def create_write_off(
         write_off: schemas.WriteOffCreate,
@@ -286,13 +285,22 @@ def create_write_off(
 
     total_loss = write_off.quantity * product.purchase_price
 
+    # Определяем требуется ли утверждение
+    requires_approval = total_loss >= 1000.00  # Порог 1000 рублей
+
     write_off_data = write_off.dict()
     write_off_data["recorded_by"] = current_user.id
     write_off_data["total_loss"] = total_loss
+    write_off_data["status"] = schemas.WriteOffStatus.PENDING if requires_approval else schemas.WriteOffStatus.APPROVED
+    write_off_data["requires_approval"] = requires_approval
+    write_off_data["approval_threshold"] = 1000.00
 
     db_write_off = write_off_repo.create(write_off_data)
 
-    product.current_quantity -= write_off.quantity
+    # Если не требуется утверждение, сразу списываем
+    if not requires_approval:
+        product.current_quantity -= write_off.quantity
+
     db.commit()
 
     inventory_subject.notify(
@@ -302,7 +310,6 @@ def create_write_off(
     )
 
     return db_write_off
-
 
 @app.get("/write-offs/", response_model=List[schemas.WriteOff])
 def read_write_offs(
@@ -678,3 +685,229 @@ def get_predictive_analytics(
         }
 
     return result
+
+
+# app/main.py - добавляем новые эндпоинты
+
+# Комментарии к списаниям
+@app.post("/write-offs/{write_off_id}/comments", response_model=schemas.WriteOffComment)
+def add_write_off_comment(
+        write_off_id: int,
+        comment: schemas.WriteOffCommentCreate,
+        db: Session = Depends(get_db),
+        current_user: models.User = Depends(auth.get_current_active_user)
+):
+    # Проверяем существование списания
+    write_off = db.query(models.WriteOff).filter(models.WriteOff.id == write_off_id).first()
+    if not write_off:
+        raise HTTPException(status_code=404, detail="Write-off not found")
+
+    db_comment = models.WriteOffComment(
+        write_off_id=write_off_id,
+        user_id=current_user.id,
+        comment=comment.comment,
+        attachment_url=comment.attachment_url
+    )
+    db.add(db_comment)
+    db.commit()
+    db.refresh(db_comment)
+    return db_comment
+
+
+@app.get("/write-offs/{write_off_id}/comments", response_model=List[schemas.WriteOffComment])
+def get_write_off_comments(
+        write_off_id: int,
+        db: Session = Depends(get_db),
+        current_user: models.User = Depends(auth.get_current_active_user)
+):
+    comments = db.query(models.WriteOffComment).filter(
+        models.WriteOffComment.write_off_id == write_off_id
+    ).order_by(models.WriteOffComment.created_at.desc()).all()
+    return comments
+
+
+# Подтверждение списаний
+@app.post("/write-offs/{write_off_id}/approve", response_model=schemas.WriteOffApproval)
+def approve_write_off(
+        write_off_id: int,
+        approval: schemas.WriteOffApprovalCreate,
+        db: Session = Depends(get_db),
+        current_user: models.User = Depends(get_current_manager())  # Только менеджеры и админы
+):
+    write_off = db.query(models.WriteOff).filter(models.WriteOff.id == write_off_id).first()
+    if not write_off:
+        raise HTTPException(status_code=404, detail="Write-off not found")
+
+    # Проверяем, не подтверждено ли уже
+    existing_approval = db.query(models.WriteOffApproval).filter(
+        models.WriteOffApproval.write_off_id == write_off_id,
+        models.WriteOffApproval.approver_id == current_user.id
+    ).first()
+
+    if existing_approval:
+        raise HTTPException(status_code=400, detail="You have already reviewed this write-off")
+
+    db_approval = models.WriteOffApproval(
+        write_off_id=write_off_id,
+        approver_id=current_user.id,
+        status=approval.status,
+        comments=approval.comments,
+        approved_at=datetime.now() if approval.status == schemas.WriteOffStatus.APPROVED else None
+    )
+
+    # Обновляем статус списания
+    write_off.status = approval.status
+
+    db.add(db_approval)
+    db.commit()
+    db.refresh(db_approval)
+
+    return db_approval
+
+
+@app.get("/write-offs/pending-approval", response_model=List[schemas.WriteOff])
+def get_pending_approvals(
+        db: Session = Depends(get_db),
+        current_user: models.User = Depends(get_current_manager())
+):
+    write_offs = db.query(models.WriteOff).filter(
+        models.WriteOff.status == models.WriteOffStatus.PENDING,
+        models.WriteOff.requires_approval == True
+    ).all()
+    return write_offs
+
+
+# Сканирование QR-кодов
+@app.post("/products/scan", response_model=schemas.ProductScan)
+def scan_product(
+        scan: schemas.ProductScanCreate,
+        db: Session = Depends(get_db),
+        current_user: models.User = Depends(auth.get_current_active_user)
+):
+    # Поиск товара по QR коду
+    product = None
+    if scan.qr_code_data:
+        # Попробуем найти по полю qr_code
+        product = db.query(models.Product).filter(
+            models.Product.qr_code == scan.qr_code_data
+        ).first()
+
+        # Если не нашли, попробуем распарсить QR код (может содержать SKU)
+        if not product and "SKU:" in scan.qr_code_data:
+            sku = scan.qr_code_data.split("SKU:")[1].strip()
+            product = db.query(models.Product).filter(models.Product.sku == sku).first()
+
+    # Если товар не найден по QR, используем product_id из запроса
+    if not product:
+        product = db.query(models.Product).filter(models.Product.id == scan.product_id).first()
+
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    # Создаем запись о сканировании
+    db_scan = models.ProductScan(
+        product_id=product.id,
+        scanned_by=current_user.id,
+        scan_type=scan.scan_type,
+        qr_code_data=scan.qr_code_data,
+        location=scan.location,
+        device_info=scan.device_info
+    )
+
+    # Обновляем время последнего сканирования товара
+    product.last_scanned = datetime.now()
+
+    db.add(db_scan)
+    db.commit()
+    db.refresh(db_scan)
+
+    return db_scan
+
+
+# Быстрое списание через QR код
+@app.post("/write-offs/quick", response_model=schemas.WriteOff)
+def quick_write_off(
+        qr_code: str,
+        quantity: int,
+        reason_id: int,
+        notes: Optional[str] = None,
+        db: Session = Depends(get_db),
+        current_user: models.User = Depends(auth.get_current_active_user)
+):
+    # Находим товар по QR коду
+    product = db.query(models.Product).filter(
+        models.Product.qr_code == qr_code
+    ).first()
+
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found by QR code")
+
+    if product.current_quantity < quantity:
+        raise HTTPException(status_code=400, detail="Not enough quantity in stock")
+
+    # Проверяем порог для утверждения
+    total_loss = quantity * product.purchase_price
+    requires_approval = total_loss >= product.approval_threshold if hasattr(product,
+                                                                            'approval_threshold') else total_loss >= 1000
+
+    # Создаем списание
+    db_write_off = models.WriteOff(
+        product_id=product.id,
+        quantity=quantity,
+        reason_id=reason_id,
+        recorded_by=current_user.id,
+        total_loss=total_loss,
+        notes=notes,
+        status=models.WriteOffStatus.PENDING if requires_approval else models.WriteOffStatus.APPROVED,
+        requires_approval=requires_approval,
+        approval_threshold=1000.00
+    )
+
+    # Обновляем количество товара
+    product.current_quantity -= quantity
+
+    db.add(db_write_off)
+    db.commit()
+    db.refresh(db_write_off)
+
+    return db_write_off
+
+
+# Генерация QR кодов для товаров
+@app.post("/products/{product_id}/generate-qr")
+def generate_qr_code(
+        product_id: int,
+        db: Session = Depends(get_db),
+        current_user: models.User = Depends(get_current_manager())
+):
+    product = db.query(models.Product).filter(models.Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    # Генерируем уникальный QR код (можно использовать uuid)
+    import uuid
+    qr_code = f"PROD-{product.id}-{uuid.uuid4().hex[:8].upper()}"
+
+    product.qr_code = qr_code
+    db.commit()
+
+    return {
+        "product_id": product.id,
+        "product_name": product.name,
+        "qr_code": qr_code,
+        "qr_data": f"SKU:{product.sku}|ID:{product.id}|NAME:{product.name}",
+        "message": "QR code generated successfully"
+    }
+
+
+# История сканирований
+@app.get("/products/{product_id}/scan-history", response_model=List[schemas.ProductScan])
+def get_product_scan_history(
+        product_id: int,
+        db: Session = Depends(get_db),
+        current_user: models.User = Depends(auth.get_current_active_user)
+):
+    scans = db.query(models.ProductScan).filter(
+        models.ProductScan.product_id == product_id
+    ).order_by(models.ProductScan.scanned_at.desc()).all()
+    return scans
